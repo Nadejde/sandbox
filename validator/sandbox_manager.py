@@ -44,8 +44,17 @@ class SandboxManager:
             self.process_job(job['job_id'], job.get('agent_file'))
 
     def build_images(self):
-        docker.build(self.curr_dir, tags=SANDBOX_IMAGE_TAG)
-        docker.build(self.proxy_dir, tags="bitsec-proxy:latest")
+        docker.build(
+            self.proxy_dir,
+            tags="bitsec-proxy:latest",
+            build_contexts={"loggers": "loggers"},
+        )
+        docker.build(
+            self.curr_dir,
+            tags=SANDBOX_IMAGE_TAG,
+            build_contexts={"loggers": "loggers"},
+        )
+
 
     def create_internal_network(self, name):
         full_cmd = docker.network.docker_cmd + ["network", "create"]

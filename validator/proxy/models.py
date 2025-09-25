@@ -13,9 +13,11 @@ class Message(BaseModel):
 class InferenceRequest(BaseModel):
     model: str | None
     messages: list[Message]
-    max_tokens: int = Field(default=100000)
+    max_tokens: int = Field(default=60000)
     temperature: float = Field(default=0.2)
 
 class InferenceResponse(BaseModel):
     content: str
     role: Role
+    input_tokens: int
+    output_tokens: int
