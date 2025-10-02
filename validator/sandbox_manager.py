@@ -1,9 +1,12 @@
 import os
 import time
+import json
+from pathlib import Path
 from python_on_whales import docker, Network
 from validator.projects import fetch_projects
 from python_on_whales.exceptions import DockerException, NoSuchContainer, NoSuchNetwork
 from python_on_whales.utils import run
+from validator.scorer import ScaBenchScorerV2
 
 from loggers.logger import get_logger
 
@@ -109,6 +112,7 @@ class SandboxManager:
 
         for project_id in project_ids:
             self.process_job_project(job_id, project_id, agent_filepath, reports_dir)
+        return reports_dir
 
     def process_job_project(self, job_id, project_id, agent_filepath, reports_dir):
         project_report_dir = os.path.join(reports_dir, f"{project_id}")
@@ -155,7 +159,183 @@ class SandboxManager:
 
         container.remove()
 
+    def eval_jobs(self, reports_dir, project_id=None):
+        """
+        Evaluate all reports in the reports directory using ScaBenchScorerV2.
+        
+        Args:
+            reports_dir (str): Path to the directory containing report JSON files
+            project_id (str, optional): Specific project ID to evaluate. If None, evaluates all projects.
+            
+        Returns:
+            dict: Summary of scoring results for all projects
+        """
+        logger.info(f"Starting evaluation of reports in: {reports_dir}")
+        if project_id:
+            logger.info(f"Filtering to specific project: {project_id}")
+        
+        # Load benchmark data
+        benchmark_file = os.path.join(self.curr_dir, 'curated-2025-08-08.json')
+        if not os.path.exists(benchmark_file):
+            logger.error(f"Benchmark file not found: {benchmark_file}")
+            return {}
+        
+        with open(benchmark_file, 'r') as f:
+            benchmark_data = json.load(f)
+        
+        # Create a mapping of project_id to expected vulnerabilities
+        benchmark_map = {}
+        for entry in benchmark_data:
+            entry_project_id = entry.get('project_id')
+            vulnerabilities = entry.get('vulnerabilities', [])
+            if entry_project_id and vulnerabilities:
+                benchmark_map[entry_project_id] = vulnerabilities
+        
+        logger.info(f"Loaded benchmark data for {len(benchmark_map)} projects")
+        
+        # Initialize the scorer
+        scorer_config = {
+            'model': 'gpt-4o',
+            'debug': True,
+            'verbose': True,
+            'confidence_threshold': 0.75,
+            'strict_matching': False
+        }
+        scorer = ScaBenchScorerV2(scorer_config)
+        
+        # Find all report files
+        reports_path = Path(reports_dir)
+        if not reports_path.exists():
+            logger.error(f"Reports directory does not exist: {reports_dir}")
+            return {}
+        
+        # Look for report.json files in subdirectories
+        if project_id:
+            # Look for specific project report
+            specific_report = reports_path / project_id / "report.json"
+            if specific_report.exists():
+                report_files = [specific_report]
+            else:
+                logger.error(f"Report not found for project {project_id}")
+                return {}
+        else:
+            # Look for all report.json files
+            report_files = list(reports_path.glob("*/report.json"))
+        
+        if not report_files:
+            logger.warning(f"No report.json files found in {reports_dir}")
+            return {}
+        
+        logger.info(f"Found {len(report_files)} report files to evaluate")
+        
+        scoring_results = {}
+        
+        for report_file in report_files:
+            current_project_id = report_file.parent.name
+            logger.info(f"Evaluating project: {current_project_id}")
+            
+            try:
+                # Load the report
+                with open(report_file, 'r') as f:
+                    report_data = json.load(f)
+                
+                # Check if the report contains successful findings
+                if not report_data.get('success', False):
+                    logger.warning(f"Report for {current_project_id} indicates failure: {report_data.get('error', 'Unknown error')}")
+                    # Create a mock result for failed reports
+                    scoring_results[current_project_id] = {
+                        'status': 'failed',
+                        'error': report_data.get('error', 'Unknown error'),
+                        'stdout': report_data.get('stdout', ''),
+                        'stderr': report_data.get('stderr', '')
+                    }
+                    continue
+                
+                # Extract findings from the report
+                tool_findings = report_data.get('findings', [])
+                
+                # If no findings at top level, check under 'result.vulnerabilities'
+                if not tool_findings and 'result' in report_data:
+                    tool_findings = report_data['result'].get('vulnerabilities', [])
+                
+                if not tool_findings:
+                    logger.warning(f"No findings found in report for {current_project_id}")
+                    scoring_results[current_project_id] = {
+                        'status': 'no_findings',
+                        'message': 'No findings reported by the tool'
+                    }
+                    continue
+                
+                # Get expected vulnerabilities from benchmark data
+                expected_findings = benchmark_map.get(current_project_id, [])
+                
+                if not expected_findings:
+                    logger.warning(f"No benchmark data found for project {current_project_id}")
+                    scoring_results[current_project_id] = {
+                        'status': 'no_benchmark',
+                        'message': f'No benchmark data available for project {current_project_id}',
+                        'tool_findings_count': len(tool_findings)
+                    }
+                    continue
+                
+                logger.info(f"Scoring {current_project_id} with {len(expected_findings)} expected vulnerabilities and {len(tool_findings)} tool findings")
+                
+                # Score the project
+                result = scorer.score_project(
+                    expected_findings=expected_findings,
+                    tool_findings=tool_findings,
+                    project_name=current_project_id
+                )
+                
+                # Store the scoring result
+                scoring_results[current_project_id] = {
+                    'status': 'scored',
+                    'result': {
+                        'project': result.project,
+                        'timestamp': result.timestamp,
+                        'total_expected': result.total_expected,
+                        'total_found': result.total_found,
+                        'true_positives': result.true_positives,
+                        'false_negatives': result.false_negatives,
+                        'false_positives': result.false_positives,
+                        'detection_rate': result.detection_rate,
+                        'precision': result.precision,
+                        'f1_score': result.f1_score,
+                        'matched_findings': result.matched_findings,
+                        'missed_findings': result.missed_findings,
+                        'undecided_findings': result.undecided_findings,
+                        'extra_findings': result.extra_findings
+                    }
+                }
+                
+                logger.info(f"Completed scoring for {current_project_id}")
+                
+            except Exception as e:
+                logger.error(f"Error evaluating {current_project_id}: {str(e)}")
+                scoring_results[current_project_id] = {
+                    'status': 'error',
+                    'error': str(e)
+                }
+        
+        # Log summary
+        successful_scorings = sum(1 for r in scoring_results.values() if r.get('status') == 'scored')
+        failed_reports = sum(1 for r in scoring_results.values() if r.get('status') == 'failed')
+        errors = sum(1 for r in scoring_results.values() if r.get('status') == 'error')
+        no_benchmark = sum(1 for r in scoring_results.values() if r.get('status') == 'no_benchmark')
+        
+        logger.info(f"Evaluation complete: {successful_scorings} scored, {failed_reports} failed, {errors} errors, {no_benchmark} no benchmark data")
+        
+        return scoring_results
+
 if __name__ == '__main__':
     m = SandboxManager()
     # m.run()
-    m.process_job('local', agent_filepath="miner/agent.py")
+    reports_dir = m.process_job('local', agent_filepath="miner/agent.py")
+    
+    # Evaluate all reports using ScaBenchScorerV2
+    # score = m.eval_jobs(reports_dir)
+    
+    # Or evaluate a specific project (uncomment and modify the project_id)
+    score = m.eval_jobs(reports_dir, project_id="cantina_smart-contract-audit-of-tn-contracts_2025_08")
+    
+    print(f"Scoring results: {score}")
