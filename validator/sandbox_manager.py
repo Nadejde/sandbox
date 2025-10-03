@@ -398,6 +398,7 @@ if __name__ == '__main__':
     # score = m.eval_jobs(reports_dir)
     
     # Or evaluate a specific project (uncomment and modify the project_id)
+    # score = m.eval_jobs(reports_dir, project_id="code4rena_superposition_2025_01")
     score = m.eval_jobs(reports_dir)
     
     print(f"Scoring results: {score}")
