@@ -89,5 +89,25 @@ if __name__ == "__main__":
             "stderr": "",
         }
 
+    # Separate logs from the structured JSON report
+    stdout_text = result.pop("stdout", "")
+    stderr_text = result.pop("stderr", "")
+
+    # Write structured report without stdout/stderr so it remains clean JSON
     with open(REPORT_FILE, "w") as f:
         json.dump(result, f, indent=2)
+
+    # Persist logs alongside the report for debugging/traceability
+    try:
+        report_dir = os.path.dirname(REPORT_FILE) or "."
+        report_stem = os.path.splitext(os.path.basename(REPORT_FILE))[0]
+        stdout_path = os.path.join(report_dir, f"{report_stem}.stdout.log")
+        stderr_path = os.path.join(report_dir, f"{report_stem}.stderr.log")
+
+        with open(stdout_path, "w") as sf:
+            sf.write(stdout_text or "")
+        with open(stderr_path, "w") as ef:
+            ef.write(stderr_text or "")
+    except Exception:
+        # Logging file creation should never break report writing
+        pass
