@@ -392,7 +392,7 @@ class SandboxManager:
 if __name__ == '__main__':
     m = SandboxManager()
     # m.run()
-
+    reports_dir = m.process_job('local', agent_filepath="miner/agent.py")
     
     # Evaluate all reports using ScaBenchScorerV2
     # score = m.eval_jobs(reports_dir)
