@@ -1,0 +1,9 @@
+services:
+  validator:
+    build: .
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./validator/jobs:/app/validator/jobs
+    env_file: .env
+    environment:
+      - HOST_CWD=${PWD}

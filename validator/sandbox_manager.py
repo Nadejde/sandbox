@@ -27,6 +27,9 @@ PROXY_CONTAINER = 'bitsec_proxy'
 PROXY_PORT = os.getenv("PROXY_PORT", 8087)
 PLATFORM_API_URL = os.getenv("PLATFORM_API_URL", 'https://platform-lwweg.ondigitalocean.app/api/')
 
+HOST_CWD = os.getenv("HOST_CWD", '.')
+VALIDATOR_DIR = "validator"
+
 
 @dataclass
 class Job:
@@ -38,10 +41,12 @@ class Job:
 class SandboxManager:
     def __init__(self):
         fetch_projects()
-        self.curr_dir = os.path.dirname(os.path.abspath(__file__))
-        self.proxy_dir = os.path.join(self.curr_dir, 'proxy')
-        self.projects_dir = os.path.join(self.curr_dir, 'projects')
-        self.all_jobs_dir = os.path.join(self.curr_dir, 'jobs')
+        self.proxy_docker_dir = os.path.join(VALIDATOR_DIR, 'proxy')
+        self.validator_docker_dir = os.path.normpath(VALIDATOR_DIR)
+
+        self.projects_dir = os.path.join(VALIDATOR_DIR, 'projects')
+        self.all_jobs_dir = os.path.join(VALIDATOR_DIR, 'jobs')
+        self.host_projects_dir = os.path.abspath(os.path.join(HOST_CWD, VALIDATOR_DIR, 'projects'))
 
         self.build_images()
         self.init_proxy()
@@ -62,12 +67,12 @@ class SandboxManager:
 
     def build_images(self):
         docker.build(
-            self.proxy_dir,
+            self.proxy_docker_dir,
             tags="bitsec-proxy:latest",
             build_contexts={"loggers": "loggers"},
         )
         docker.build(
-            self.curr_dir,
+            self.validator_docker_dir,
             tags=SANDBOX_IMAGE_TAG,
             build_contexts={"loggers": "loggers"},
         )
@@ -139,7 +144,7 @@ class SandboxManager:
         if skip_run:
             return project_report_dir
 
-        project_code_dir = os.path.join(self.projects_dir, f"{project_id}")
+        project_code_dir = os.path.abspath(os.path.join(self.host_projects_dir, f"{project_id}"))
 
         sandbox_container = SANDBOX_CONTAINER_TMPL.format(
             job_id=job_id,
@@ -170,7 +175,7 @@ class SandboxManager:
 
         try:
             docker.copy((container, "/app/report.json"), project_report_dir)
-            logger.info(f"{run_id} Finished processing. Report copied: {project_id}")
+            logger.info(f"{run_id} Finished processing. Report copied: {project_id} {project_report_dir}")
 
         except DockerException as e:
             if e.return_code == 1 and "does not exist" in str(e):
@@ -239,7 +244,7 @@ class SandboxManager:
             logger.info(f"Filtering to specific project: {project_id}")
         
         # Load benchmark data
-        benchmark_file = os.path.join(self.curr_dir, 'curated-highs-only-2025-08-08.json')
+        benchmark_file = os.path.join(self.validator_docker_dir, 'curated-highs-only-2025-08-08.json')
         if not os.path.exists(benchmark_file):
             logger.error(f"Benchmark file not found: {benchmark_file}")
             return {}
@@ -465,11 +470,12 @@ if __name__ == '__main__':
     m = SandboxManager()
     # m.run()
 
+    agent_filepath = f"{HOST_CWD}/miner/agent.py"
     for i in range(10):
         job_id = int(time.time())
         job = Job(job_id, 1, 1)
 
-        reports_dir = m.process_job(job, agent_filepath="miner/agent.py")
+        reports_dir = m.process_job(job, agent_filepath=agent_filepath)
             
     # Evaluate all reports using ScaBenchScorerV2
     # score = m.eval_jobs(reports_dir)
