@@ -1,8 +1,10 @@
 import json
+import logging
 import os
 import requests
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,6 +13,8 @@ from python_on_whales.exceptions import DockerException, NoSuchContainer, NoSuch
 from python_on_whales.utils import run
 
 from loggers.logger import get_logger
+from validator.models.platform import JobRun, AgentExecution, AgentEvaluation
+from validator.platform_client import PlatformClient
 from validator.projects import fetch_projects
 from validator.scorer import ScaBenchScorerV2
 
@@ -20,15 +24,25 @@ logger = get_logger()
 
 ENV = os.getenv("ENV", "dev")
 SANDBOX_IMAGE_TAG = 'bitsec-sandbox:latest'
-SANDBOX_CONTAINER_TMPL = 'bitsec_sandbox_{job_id}_{project_id}'
+SANDBOX_CONTAINER_TMPL = 'bitsec_sandbox_{job_id}_{job_run_id}_{project_id}'
 PROXY_NETWORK = 'bitsec-net'
 PROXY_IMAGE_TAG = 'bitsec-proxy:latest'
 PROXY_CONTAINER = 'bitsec_proxy'
 PROXY_PORT = os.getenv("PROXY_PORT", 8087)
-PLATFORM_API_URL = os.getenv("PLATFORM_API_URL", 'https://platform-lwweg.ondigitalocean.app/api/')
+
+VALIDATOR_ID = os.getenv("VALIDATOR_ID")
+AGENT_ID = os.getenv("AGENT_ID", 1)
+SKIP_EXECUTION = os.getenv("SKIP_EXECUTION", "").lower() == "true"
+SKIP_EVALUATION = os.getenv("SKIP_EVALUATION", "").lower() == "true"
 
 HOST_CWD = os.getenv("HOST_CWD", '.')
-VALIDATOR_DIR = "validator"
+VALIDATOR_DIR = os.path.normpath('validator')
+HOST_PROJECTS_DIR = os.path.abspath(os.path.join(HOST_CWD, VALIDATOR_DIR, 'projects'))
+
+
+PLATFORM_URL = os.getenv("PLATFORM_URL")
+PLATFORM_API_KEY = os.getenv("PLATFORM_API_KEY")
+PLATFORM_CLIENT = PlatformClient(PLATFORM_URL, PLATFORM_API_KEY)
 
 
 @dataclass
@@ -39,31 +53,31 @@ class Job:
 
 
 class SandboxManager:
-    def __init__(self):
+    def __init__(self, is_local=False):
         fetch_projects()
         self.proxy_docker_dir = os.path.join(VALIDATOR_DIR, 'proxy')
-        self.validator_docker_dir = os.path.normpath(VALIDATOR_DIR)
+        self.validator_docker_dir = VALIDATOR_DIR
 
         self.projects_dir = os.path.join(VALIDATOR_DIR, 'projects')
         self.all_jobs_dir = os.path.join(VALIDATOR_DIR, 'jobs')
-        self.host_projects_dir = os.path.abspath(os.path.join(HOST_CWD, VALIDATOR_DIR, 'projects'))
+
+        self.projects_config_filepath = os.path.join(VALIDATOR_DIR, 'projects.json')
+
+        self.validator_id = VALIDATOR_ID
 
         self.build_images()
         self.init_proxy()
 
+        self.is_local = is_local
+
     def run(self):
-        jobs = [{
-            "job_id": 1,
-            "agent_file": "agent.py",
-        }]
-
         while True:
-            if not jobs:
-                time.sleep(60)
-                continue
+            job_run = PLATFORM_CLIENT.get_next_job_run(self.validator_id)
+            if job_run:
+                self.process_job_run(job_run)
 
-            job = jobs.pop(0)
-            self.process_job(job['job_id'], job.get('agent_file'))
+            else:
+                time.sleep(60)
 
     def build_images(self):
         docker.build(
@@ -76,7 +90,6 @@ class SandboxManager:
             tags=SANDBOX_IMAGE_TAG,
             build_contexts={"loggers": "loggers"},
         )
-
 
     def create_internal_network(self, name):
         full_cmd = docker.network.docker_cmd + ["network", "create"]
@@ -103,6 +116,65 @@ class SandboxManager:
         )
         docker.network.connect(PROXY_NETWORK, PROXY_CONTAINER)
 
+    def get_project_ids(self, json_path):
+        with open(json_path, encoding="utf-8") as f:
+            projects = json.load(f)
+
+        project_ids = [project["project_id"] for project in projects]
+        return project_ids
+
+    def process_job_run(self, job_run, agent_filepath='agent.py', skip_run=False):
+        logger.info(f"[J:{job_run.job_id}|JR:{job_run.id}] Processing job run")
+        job_run_dir = os.path.join(self.all_jobs_dir, f"job_run_{job_run.id}")
+        job_run_reports_dir = os.path.join(job_run_dir, "reports")
+        os.makedirs(job_run_reports_dir, exist_ok=True)
+
+        if self.is_local:
+            agent_filepath = f"{HOST_CWD}/miner/agent.py"
+
+        if not agent_filepath:
+            # TODO: download agent file
+            pass
+
+        agent_filepath = os.path.abspath(agent_filepath)
+
+        project_ids = self.get_project_ids(self.projects_config_filepath)
+
+        for project_id in project_ids:
+            executor = AgentExecutor(job_run, agent_filepath, project_id, job_run_reports_dir)
+            executor.run()
+
+
+class AgentExecutor:
+    def __init__(
+        self,
+        job_run,
+        agent_filepath,
+        project_id,
+        job_run_reports_dir,
+    ):
+        self.job_run = job_run
+        self.agent_filepath = agent_filepath
+        self.project_id = project_id
+        self.job_run_reports_dir = job_run_reports_dir
+
+        self.project_report_dir = os.path.join(self.job_run_reports_dir, f"{self.project_id}")
+        os.makedirs(self.project_report_dir, exist_ok=True)
+
+        self.agent_execution_id: int | None = None
+        self.agent_evaluation_id: int | None = None
+
+        self.init_logger()
+
+    def init_logger(self):
+        log_prefix = f"[J:{self.job_run.job_id}|JR:{self.job_run.id}|P:{self.project_id}]"
+        self.logger = logging.LoggerAdapter(logger, {'prefix': log_prefix})
+
+        def process(msg, kwargs):
+            return f"{log_prefix} {msg}", kwargs
+        
+        self.logger.process = process
+
     def remove_container(self, container_name):
         try:
             docker.remove(container_name, force=True)
@@ -111,124 +183,104 @@ class SandboxManager:
             logger.error(f"Exit code {e.return_code} while running {e.docker_command}")
             raise
 
-    def process_job(self, job, agent_filepath='agent.py', skip_run=False):
-        job_id = job.job_id
-        logger.info(f"Processing job ID: {job_id}")
-        job_dir = os.path.join(self.all_jobs_dir, f"job_{job_id}")
-        reports_dir = os.path.join(job_dir, "reports")
-        os.makedirs(reports_dir, exist_ok=True)
+    def run(self):
+        self.started_at = datetime.utcnow()
 
-        if not agent_filepath:
-            # TODO: download agent file
-            pass
+        if not SKIP_EXECUTION:
+            self.run_project()
+            self.agent_execution_id = self.submit_agent_execution()
 
-        agent_filepath = os.path.abspath(agent_filepath)
+        self.eval_job_runs()
 
-        project_ids = [
-            name for name in os.listdir(self.projects_dir)
-            if os.path.isdir(os.path.join(self.projects_dir, name))
-        ]
-        logger.info(f"Found {len(project_ids)} projects")
-
-        for project_id in project_ids:
-            project_report_dir = self.process_job_project(job_id, project_id, agent_filepath, reports_dir)
-            self.submit_agent_report(job, project_id, job, project_report_dir)
-            self.eval_jobs(reports_dir, project_id)
-
-        return reports_dir
-
-    def process_job_project(self, job_id, project_id, agent_filepath, reports_dir, skip_run=False):
-        project_report_dir = os.path.join(reports_dir, f"{project_id}")
-        os.makedirs(project_report_dir, exist_ok=True)
-
-        if skip_run:
-            return project_report_dir
-
-        project_code_dir = os.path.abspath(os.path.join(self.host_projects_dir, f"{project_id}"))
+    def run_project(self):
+        if SKIP_EXECUTION:
+            return
 
         sandbox_container = SANDBOX_CONTAINER_TMPL.format(
-            job_id=job_id,
-            project_id=project_id,
+            job_id=self.job_run.job_id,
+            job_run_id=self.job_run.id,
+            project_id=self.project_id,
         )
 
-        run_id = f"[J:{job_id}|P:{project_id}]"
+        project_code_dir = os.path.abspath(os.path.join(HOST_PROJECTS_DIR, f"{self.project_id}"))
 
         # clear any previous container runs
         self.remove_container(sandbox_container)
 
-        logger.info(f"{run_id} Starting container")
+        self.logger.info(f"Starting container")
         container = docker.run(
             SANDBOX_IMAGE_TAG,
             name=sandbox_container,
             networks=[PROXY_NETWORK],
             volumes=[
-                (agent_filepath, '/app/agent.py'),
+                (self.agent_filepath, '/app/agent.py'),
                 (project_code_dir, '/app/project_code'),
             ],
             envs={
-                "JOB_ID": job_id,
-                "PROJECT_ID": project_id,
+                "JOB_ID": self.job_run.job_id,
+                "JOB_RUN_ID": self.job_run.id,
+                "PROJECT_ID": self.project_id,
             },
             detach=True,
         )
         docker.wait(container)
 
         try:
-            docker.copy((container, "/app/report.json"), project_report_dir)
-            logger.info(f"{run_id} Finished processing. Report copied: {project_id} {project_report_dir}")
+            docker.copy((container, "/app/report.json"), self.project_report_dir)
+            self.logger.info(f"Finished processing. Report copied: {self.project_id} {self.project_report_dir}")
 
         except DockerException as e:
             if e.return_code == 1 and "does not exist" in str(e):
-                logger.error(f"{run_id} Report not found in container")
+                logger.error(f"Report not found in container")
             else:
                 raise
 
         container.remove()
-        return project_report_dir
 
-    def submit_agent_report(self, job: Job, project_id: str, run_id: str, project_report_dir: str):
-        if ENV == 'local':
-            return
-
-        report_filepath = os.path.join(project_report_dir, 'report.json')
+    def submit_agent_execution(self):
+        report_filepath = os.path.join(self.project_report_dir, 'report.json')
         if not Path(report_filepath).is_file():
-            logger.error(f"{run_id} Report not found")
-            return
+            self.logger.error(f"Report not found")
+            return # TODO: submit with error
 
         with open(report_filepath, "r", encoding="utf-8") as f:
             report_dict = json.load(f)
 
-        report_dict['project'] = project_id
-        report_dict.update(asdict(job))
-        report_dict.setdefault('stdout', '')
-        report_dict.setdefault('stderr', '')
+        report_dict['validator_id'] = self.job_run.validator_id
+        report_dict['agent_id'] = AGENT_ID # TODO: get from agent call for code
+        report_dict['job_run_id'] = self.job_run.id
+        report_dict['project'] = self.project_id
+        report_dict['status'] = 'success'
+        report_dict['started_at'] = self.started_at
+        report_dict['completed_at'] = datetime.utcnow()
+
+        agent_execution = AgentExecution.model_validate(report_dict)
 
         try:
-            url = f"{PLATFORM_API_URL}agents/reports/"
-            resp = requests.post(url, json=report_dict)
-            resp.raise_for_status()
-            logger.info(f"{run_id} Agent report submitted")
+            resp = PLATFORM_CLIENT.submit_agent_execution(agent_execution)
+            return resp['id']
 
         except Exception as e:
-            logger.error(f"{run_id} Error submitting report: {e}")
+            self.logger.exception(f"Error submitting agent execution: {e}")
             return
 
-    def submit_project_eval(self, agent_id: int, project: str, project_scoring_results: str):
+    def submit_agent_evaluation(self, project_scoring_results):
         scoring_data = {}
+        scoring_data['agent_execution_id'] = self.agent_execution_id
         scoring_data['status'] = project_scoring_results['status']
         scoring_data.update(project_scoring_results['result'])
 
+        agent_evaluation = AgentEvaluation.model_validate(scoring_data)
+
         try:
-            url = f"{PLATFORM_API_URL}agents/eval/"
-            resp = requests.post(url, json=scoring_data)
-            resp.raise_for_status()
-            # logger.info(f"{run_id} Agent eval submitted")
+            resp = PLATFORM_CLIENT.submit_agent_evaluation(agent_evaluation)
+            return resp['id']
 
         except Exception as e:
-            # logger.error(f"{run_id} Error submitting eval: {e}")
+            self.logger.exception(f"Error submitting agent execution: {e}")
             return
 
-    def eval_jobs(self, reports_dir, project_id=None):
+    def eval_job_runs(self):
         """
         Evaluate all reports in the reports directory using ScaBenchScorerV2.
         
@@ -239,19 +291,19 @@ class SandboxManager:
         Returns:
             dict: Summary of scoring results for all projects
         """
-        logger.info(f"Starting evaluation of reports in: {reports_dir}")
-        if project_id:
-            logger.info(f"Filtering to specific project: {project_id}")
-        
+        logger.info(f"Starting evaluation of reports in: {self.job_run_reports_dir}")
+        if self.project_id:
+            logger.info(f"Filtering to specific project: {self.project_id}")
+
         # Load benchmark data
-        benchmark_file = os.path.join(self.validator_docker_dir, 'curated-highs-only-2025-08-08.json')
+        benchmark_file = os.path.join(VALIDATOR_DIR, 'curated-highs-only-2025-08-08.json')
         if not os.path.exists(benchmark_file):
             logger.error(f"Benchmark file not found: {benchmark_file}")
             return {}
-        
+
         with open(benchmark_file, 'r') as f:
             benchmark_data = json.load(f)
-        
+
         # Create a mapping of project_id to expected vulnerabilities
         benchmark_map = {}
         for entry in benchmark_data:
@@ -259,9 +311,9 @@ class SandboxManager:
             vulnerabilities = entry.get('vulnerabilities', [])
             if entry_project_id and vulnerabilities:
                 benchmark_map[entry_project_id] = vulnerabilities
-        
+
         logger.info(f"Loaded benchmark data for {len(benchmark_map)} projects")
-        
+
         # Initialize the scorer
         scorer_config = {
             'model': 'gpt-4o',
@@ -271,17 +323,13 @@ class SandboxManager:
             'strict_matching': False
         }
         scorer = ScaBenchScorerV2(scorer_config)
-        
-        # Find all report files
-        reports_path = Path(reports_dir)
-        if not reports_path.exists():
-            logger.error(f"Reports directory does not exist: {reports_dir}")
-            return {}
-        
+
+        reports_path = Path(self.job_run_reports_dir)
+
         # Look for report.json files in subdirectories
-        if project_id:
+        if self.project_id:
             # Look for specific project report
-            specific_report = reports_path / project_id / "report.json"
+            specific_report = reports_path / self.project_id / "report.json"
             if specific_report.exists():
                 report_files = [specific_report]
             else:
@@ -292,22 +340,22 @@ class SandboxManager:
             report_files = list(reports_path.glob("*/report.json"))
         
         if not report_files:
-            logger.warning(f"No report.json files found in {reports_dir}")
+            logger.warning(f"No report.json files found in {reports_path}")
             return {}
-        
+
         logger.info(f"Found {len(report_files)} report files to evaluate")
-        
+
         scoring_results = {}
-        
+
         for report_file in report_files:
             current_project_id = report_file.parent.name
             logger.info(f"Evaluating project: {current_project_id}")
-            
+
             try:
                 # Load the report
                 with open(report_file, 'r') as f:
                     report_data = json.load(f)
-                
+
                 # Check if the report contains successful findings
                 if not report_data.get('success', False):
                     logger.warning(f"Report for {current_project_id} indicates failure: {report_data.get('error', 'Unknown error')}")
@@ -333,14 +381,14 @@ class SandboxManager:
                     except Exception as e:
                         logger.error(f"Failed to write failure scoring summary for {current_project_id}: {str(e)}")
                     continue
-                
+
                 # Extract findings from the report
                 tool_findings = report_data.get('findings', [])
-                
+
                 # If no findings at top level, check under 'report.vulnerabilities'
                 if not tool_findings and 'report' in report_data:
                     tool_findings = report_data['report'].get('vulnerabilities', [])
-                
+
                 if not tool_findings:
                     logger.warning(f"No findings found in report for {current_project_id}")
                     scoring_results[current_project_id] = {
@@ -348,10 +396,10 @@ class SandboxManager:
                         'message': 'No findings reported by the tool'
                     }
                     continue
-                
+
                 # Get expected vulnerabilities from benchmark data
                 expected_findings = benchmark_map.get(current_project_id, [])
-                
+
                 if not expected_findings:
                     logger.warning(f"No benchmark data found for project {current_project_id}")
                     scoring_results[current_project_id] = {
@@ -360,9 +408,9 @@ class SandboxManager:
                         'tool_findings_count': len(tool_findings)
                     }
                     continue
-                
+
                 logger.info(f"Scoring {current_project_id} with {len(expected_findings)} expected vulnerabilities and {len(tool_findings)} tool findings")
-                
+
                 # Score the project
                 result = scorer.score_project(
                     expected_findings=expected_findings,
@@ -371,7 +419,7 @@ class SandboxManager:
                 )
 
                 project_scoring_results = {
-                    'status': 'scored',
+                    'status': 'success',
                     'result': {
                         'project': result.project,
                         'timestamp': result.timestamp,
@@ -385,19 +433,15 @@ class SandboxManager:
                         'f1_score': result.f1_score,
                         'matched_findings': result.matched_findings,
                         'missed_findings': result.missed_findings,
+                        'extra_findings': result.extra_findings,
                         'undecided_findings': result.undecided_findings,
-                        'extra_findings': result.extra_findings
                     }
                 }
-                
+
                 # Store the scoring result
                 scoring_results[current_project_id] = project_scoring_results
 
-                self.submit_project_eval(
-                    agent_id=1,
-                    project=current_project_id,
-                    project_scoring_results=project_scoring_results,
-                )
+                self.agent_evaluation_id = self.submit_agent_evaluation(project_scoring_results=project_scoring_results)
 
                 # Concise summary for CI/logs: true positives vs expected
                 logger.info(
@@ -438,45 +482,39 @@ class SandboxManager:
                         json.dump(project_summary, sf, indent=2)
                 except Exception as e2:
                     logger.error(f"Failed to write error scoring summary for {current_project_id}: {str(e2)}")
-        
-        # Log summary
+
         successful_scorings = sum(1 for r in scoring_results.values() if r.get('status') == 'scored')
         failed_reports = sum(1 for r in scoring_results.values() if r.get('status') == 'failed')
         errors = sum(1 for r in scoring_results.values() if r.get('status') == 'error')
         no_benchmark = sum(1 for r in scoring_results.values() if r.get('status') == 'no_benchmark')
-        
+
         logger.info(f"Evaluation complete: {successful_scorings} scored, {failed_reports} failed, {errors} errors, {no_benchmark} no benchmark data")
-        
-        # # Persist aggregate summary at reports root
-        # try:
-        #     aggregate = {}
-        #     for pid, res in scoring_results.items():
-        #         if res.get('status') == 'scored':
-        #             agg_res = res.get('report', {})
-        #             aggregate[pid] = {
-        #                 'expected': agg_res.get('total_expected', 0),
-        #                 'found': agg_res.get('true_positives', 0),
-        #                 'timestamp': agg_res.get('timestamp')
-        #             }
-        #     aggregate_path = Path(reports_dir) / "scoring_summary.json"
-        #     with open(aggregate_path, 'w') as af:
-        #         json.dump(aggregate, af, indent=2)
-        # except Exception as e:
-        #     logger.error(f"Failed to write aggregate scoring summary: {str(e)}")
-        
+
         return scoring_results
 
 if __name__ == '__main__':
-    m = SandboxManager()
-    # m.run()
+    m = SandboxManager(is_local=True)
+    m.run()
 
-    agent_filepath = f"{HOST_CWD}/miner/agent.py"
-    while True:
-        job_id = int(time.time())
-        job = Job(job_id, 1, 1)
+    # agent_filepath = f"{HOST_CWD}/miner/agent.py"
 
-        reports_dir = m.process_job(job, agent_filepath=agent_filepath)
-            
+    # while True:
+    #     job_run_id = int(time.time())
+    #     data = {
+    #         "id": job_run_id,
+    #         "started_at": None,
+    #         "completed_at": None,
+    #         "updated_at": "2025-10-10T11:59:11.959776",
+    #         "job_id": 1,
+    #         "validator_id": 3,
+    #         "status": "pending",
+    #         "created_at": "2025-10-10T11:59:11.959759"
+    #     }
+    #     job_run = JobRun.model_validate(data)
+
+    #     job_run = PLATFORM_CLIENT.get_next_job_run(VALIDATOR_ID)
+    #     m.process_job_run(job_run, agent_filepath)
+
     # Evaluate all reports using ScaBenchScorerV2
     # score = m.eval_jobs(reports_dir)
     

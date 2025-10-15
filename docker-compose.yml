@@ -9,3 +9,5 @@ services:
     env_file: .env
     environment:
       - HOST_CWD=${PWD}
+      - SKIP_EXECUTION
+      - SKIP_EVALUATION
