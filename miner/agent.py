@@ -220,7 +220,7 @@ class BaselineRunner:
             
         except Exception as e:
             console.print(f"[red]Error analyzing {file_path.name}: {e}[/red]")
-            return Vulnerabilities([]), 0, 0
+            return Vulnerabilities(vulnerabilities=[]), 0, 0
 
     def analyze_project(
         self, 

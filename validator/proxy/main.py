@@ -17,6 +17,8 @@ CHUTES_API_URL = "https://llm.chutes.ai/v1/chat/completions"
 DEFAULT_MODEL = "unsloth/gemma-3-12b-it"
 # DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3.1"
 TIMEOUT = 300
+MAX_RETRIES = 5
+BACKOFF_FACTOR = 1.5
 
 
 @app.post("/inference", response_model=InferenceResponse)
@@ -35,16 +37,27 @@ async def inference(
     }
     payload_dict = request.model_dump()
 
-    try:
-        logger.info(f"Sending request to Chutes")
-        resp = requests.post(CHUTES_API_URL, headers=headers, json=payload_dict, timeout=TIMEOUT)
-        resp.raise_for_status()
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            logger.info(f"Sending request to Chutes. Attempt: {attempt}")
+            resp = requests.post(CHUTES_API_URL, headers=headers, json=payload_dict, timeout=TIMEOUT)
 
-        # TODO: Add handling for errors, pass on some errors
+            resp.raise_for_status()
+            break
 
-    except requests.RequestException as e:
-        logger.error(f"Chutes API error: {e} {resp.text}")
-        raise HTTPException(status_code=502, detail=f"Chutes API error: {e}")
+            # TODO: Add handling for errors, pass on some errors
+
+        except requests.RequestException as e:
+            status = resp.status
+            if status not in (502, 429):
+                logger.error(f"Chutes API non-retryable error: {e} {resp.text}")
+
+            if attempt == MAX_RETRIES:
+                logger.error(f"Chutes API error after {attempt} attempts: {e} {resp.text}")
+
+            sleep_time = BACKOFF_FACTOR * (2 ** (attempt - 1))
+            logger.warning(f"Received {status} from Chutes API, retrying in {sleep_time:.1f}s...")
+            time.sleep(sleep_time)
 
     resp_json = resp.json()
     logger.info(f"Received response from Chutes: {json.dumps(resp_json, indent=2)}")
