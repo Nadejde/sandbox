@@ -13,6 +13,10 @@ class JobRun(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+class MockJobRun(BaseModel):
+    id: int
+    job_id: int
+    validator_id: int
 
 class AgentCode(BaseModel):
     code: str

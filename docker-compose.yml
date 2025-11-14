@@ -6,8 +6,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./validator/jobs:/app/validator/jobs
       - ./validator/projects:/app/validator/projects
+      - "${HOME}/.bittensor/wallets/${WALLET_NAME}/hotkeys:/root/.bittensor/wallets/${WALLET_NAME}/hotkeys"
     env_file: .env
     environment:
       - HOST_CWD=${PWD}
-      - SKIP_EXECUTION
-      - SKIP_EVALUATION
+      - PLATFORM_URL=http://host.docker.internal:8000
+      - LOCAL
+      # - SKIP_EXECUTION
+      # - SKIP_EVALUATION

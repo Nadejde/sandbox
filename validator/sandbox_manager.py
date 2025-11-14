@@ -12,6 +12,7 @@ from python_on_whales import docker, Network
 from python_on_whales.exceptions import DockerException, NoSuchContainer, NoSuchNetwork
 from python_on_whales.utils import run
 
+from config import settings
 from loggers.logger import get_logger
 from validator.models.platform import JobRun, AgentExecution, AgentEvaluation
 from validator.platform_client import PlatformClient
@@ -31,17 +32,12 @@ PROXY_CONTAINER = 'bitsec_proxy'
 PROXY_PORT = os.getenv("PROXY_PORT", 8087)
 
 VALIDATOR_ID = os.getenv("VALIDATOR_ID")
-AGENT_ID = os.getenv("AGENT_ID", 1)
 SKIP_EXECUTION = os.getenv("SKIP_EXECUTION", "").lower() == "true"
 SKIP_EVALUATION = os.getenv("SKIP_EVALUATION", "").lower() == "true"
 
 HOST_CWD = os.getenv("HOST_CWD", '.')
 VALIDATOR_DIR = os.path.normpath('validator')
 HOST_PROJECTS_DIR = os.path.abspath(os.path.join(HOST_CWD, VALIDATOR_DIR, 'projects'))
-
-PLATFORM_URL = os.getenv("PLATFORM_URL")
-PLATFORM_API_KEY = os.getenv("PLATFORM_API_KEY")
-PLATFORM_CLIENT = PlatformClient(PLATFORM_URL, PLATFORM_API_KEY)
 
 
 class SandboxManager:
@@ -57,6 +53,8 @@ class SandboxManager:
 
         self.validator_id = VALIDATOR_ID
 
+        self.platform_client = PlatformClient(is_local=is_local)
+
         self.build_images()
         self.init_proxy()
 
@@ -64,13 +62,16 @@ class SandboxManager:
 
     def run(self):
         while True:
-            job_run = PLATFORM_CLIENT.get_next_job_run(self.validator_id)
+            job_run = self.platform_client.get_next_job_run(self.validator_id)
             if job_run:
                 self.process_job_run(job_run)
 
             else:
                 logger.info("No job runs available")
                 time.sleep(60)
+
+            if is_local:
+                break
 
     def build_images(self):
         docker.build(
@@ -119,7 +120,7 @@ class SandboxManager:
     def process_job_run(self, job_run, skip_run=False):
         logger.info(f"[J:{job_run.job_id}|JR:{job_run.id}] Processing job run")
 
-        PLATFORM_CLIENT.start_job_run(job_run.id)
+        self.platform_client.start_job_run(job_run.id)
 
         job_run_dir = os.path.join(self.all_jobs_dir, f"job_run_{job_run.id}")
         job_run_reports_dir = os.path.join(job_run_dir, "reports")
@@ -130,7 +131,7 @@ class SandboxManager:
             agent_filepath = os.path.abspath(agent_filepath)
 
         else:
-            agent_code = PLATFORM_CLIENT.get_job_run_code(job_run_id=job_run.id)
+            agent_code = self.platform_client.get_job_run_code(job_run_id=job_run.id)
             agent_filepath_rel = os.path.join(job_run_dir, 'agent.py')
             with open(agent_filepath_rel, "w", encoding="utf-8") as f:
                 f.write(agent_code)
@@ -140,11 +141,17 @@ class SandboxManager:
         project_ids = self.get_project_ids(self.projects_config_filepath)
 
         for project_id in project_ids:
-            executor = AgentExecutor(job_run, agent_filepath, project_id, job_run_reports_dir)
+            executor = AgentExecutor(
+                job_run,
+                agent_filepath,
+                project_id,
+                job_run_reports_dir,
+                platform_client=self.platform_client,
+            )
             executor.run()
 
         # TODO: Check if finished successfully or part-fail
-        PLATFORM_CLIENT.complete_job_run(job_run.id)
+        self.platform_client.complete_job_run(job_run.id)
 
 
 class AgentExecutor:
@@ -154,11 +161,13 @@ class AgentExecutor:
         agent_filepath,
         project_id,
         job_run_reports_dir,
+        platform_client,
     ):
         self.job_run = job_run
         self.agent_filepath = agent_filepath
         self.project_id = project_id
         self.job_run_reports_dir = job_run_reports_dir
+        self.platform_client = platform_client
 
         self.project_report_dir = os.path.join(self.job_run_reports_dir, f"{self.project_id}")
         os.makedirs(self.project_report_dir, exist_ok=True)
@@ -256,7 +265,7 @@ class AgentExecutor:
         agent_execution = AgentExecution.model_validate(report_dict)
 
         try:
-            resp = PLATFORM_CLIENT.submit_agent_execution(agent_execution)
+            resp = self.platform_client.submit_agent_execution(agent_execution)
             return resp['id']
 
         except Exception as e:
@@ -276,7 +285,7 @@ class AgentExecutor:
         agent_evaluation = AgentEvaluation.model_validate(scoring_data)
 
         try:
-            resp = PLATFORM_CLIENT.submit_agent_evaluation(agent_evaluation)
+            resp = self.platform_client.submit_agent_evaluation(agent_evaluation)
             agent_evaluation_id = resp['id']
             return agent_evaluation_id
 
@@ -497,7 +506,9 @@ class AgentExecutor:
         return scoring_results
 
 if __name__ == '__main__':
-    m = SandboxManager(is_local=False)
+    local = settings.local
+    logger.info(f"LOCAL: {local}")
+    m = SandboxManager(is_local=local)
     m.run()
 
     # agent_filepath = f"{HOST_CWD}/miner/agent.py"

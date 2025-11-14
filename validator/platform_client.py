@@ -2,6 +2,7 @@ import base64
 import os
 import json
 import secrets
+import time
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -9,7 +10,7 @@ import requests
 from bittensor_wallet import Wallet
 
 from config import settings
-from validator.models.platform import JobRun, AgentExecution, AgentEvaluation, AgentCode, User
+from validator.models.platform import JobRun, AgentExecution, AgentEvaluation, AgentCode, User, MockJobRun
 
 
 class PlatformError(Exception):
@@ -19,12 +20,11 @@ class PlatformError(Exception):
         self.details = details
 
 
-class PlatformClient:
-    def __init__(self, base_url: str, timeout: int = 10, wallet_name: str | None = None):
-        self.base_url = base_url.rstrip("/")
+class APIPlatformClient:
+    def __init__(self, base_url: str | None = None, timeout: int = 10, wallet_name: str | None = None):
+        self.base_url = (base_url or settings.platform_url).rstrip("/")
         self.timeout = timeout
-        if wallet_name:
-            self.set_wallet(wallet_name)
+        self.set_wallet(wallet_name)
 
     def set_wallet(self, wallet_name: str | None = None):
         wallet_name = wallet_name or settings.wallet_name
@@ -152,3 +152,35 @@ class PlatformClient:
         payload = user.model_dump(mode="json")
         resp = self._call_api("post", endpoint, json=payload, authenticate=True)
         return resp
+
+
+class MockPlatformClient:
+    def __getattr__(self, name):
+        def _method(*args, **kwargs):
+            return {'id': 1}
+        return _method
+
+    def get_next_job_run(self, validator_id: int):
+        job_run = MockJobRun(
+            id=int(time.time()),
+            job_id=1,
+            validator_id=1,
+        )
+        return job_run
+
+
+class PlatformClient:
+    """
+    Public interface for consumers.
+    Delegates all calls to either APIPlatformClient or MockPlatformClient.
+    Forwards all args/kwargs transparently to the underlying client,
+    while reserving `is_local` as a keyword-only argument.
+    """
+    def __init__(self, *args, is_local=False, **kwargs):
+        if is_local:
+            self._client = MockPlatformClient(*args, **kwargs)
+        else:
+            self._client = APIPlatformClient(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)

@@ -11,3 +11,4 @@ rich>=13
 # setuptools>=68
 starlette>=0.30.0
 # torch>=2
+typer==0.20.0

@@ -4,24 +4,54 @@ bitsec.py
 
 Bitsec CLI utility for miners and validators.
 Operations are signed with a Bittensor wallet hotkey.
-
-Usage examples:
-
 """
-import argparse
+
 import os
+import subprocess
 from pathlib import Path
+
+import typer
+from typer import Option, Argument
 
 from config import settings
 from loggers.logger import get_logger
 from validator.platform_client import PlatformClient
 from validator.models.platform import User, UserRole, AgentCode
 
-
-PLATFORM_CLIENT = PlatformClient(settings.platform_url)
 logger = get_logger()
 
+# -------------------------------------------------------
+# Typer apps
+# -------------------------------------------------------
+app = typer.Typer(help="Bitsec CLI for miners and validators", pretty_exceptions_enable=False)
+miner_app = typer.Typer(help="Miner operations")
+validator_app = typer.Typer(help="Validator operations")
 
+# Register sub-apps
+app.add_typer(miner_app, name="miner")
+app.add_typer(validator_app, name="validator")
+
+# -------------------------------------------------------
+# Module-level global
+# -------------------------------------------------------
+PLATFORM_CLIENT: PlatformClient | None = None
+
+# -------------------------------------------------------
+# App-level initialization
+# -------------------------------------------------------
+@app.callback()
+def init(wallet: str = Option(None, help="Bittensor wallet name")):
+    """
+    Initialize global resources for all subcommands.
+    Currently initializes PLATFORM_CLIENT, can be extended for other things.
+    """
+    global PLATFORM_CLIENT
+    PLATFORM_CLIENT = PlatformClient(settings.platform_url, wallet_name=wallet)
+    logger.info(f"Initialized PLATFORM_CLIENT with wallet: {wallet}")
+
+# -------------------------------------------------------
+# Original helper functions (unchanged)
+# -------------------------------------------------------
 def create_user(
     email: str,
     name: str | None,
@@ -40,8 +70,20 @@ def create_user(
 
     logger.info(f"{user['role']} User {user['email']} created with hotkey: {user['hotkey']}")
 
+# -------------------------------------------------------
+# Miner commands
+# -------------------------------------------------------
+@miner_app.command("create")
+def miner_create(
+    email: str = Argument(..., help="Email of the miner"),
+    name: str | None = Argument(None, help="Optional name"),
+):
+    """Create a miner account."""
+    create_user(email=email, name=name, is_miner=True)
 
-def submit_agent() -> None:
+@miner_app.command("submit")
+def miner_submit():
+    """Submit the miner agent code."""
     agent_path = Path("miner/agent.py")
     if not agent_path.exists():
         raise FileNotFoundError(agent_path)
@@ -52,71 +94,27 @@ def submit_agent() -> None:
     agent = PLATFORM_CLIENT.submit_agent(agent_code)
     logger.info(f"Agent submitted: version {agent['version']}")
 
+@miner_app.command("run")
+def miner_run():
+    env = os.environ.copy()
+    env["LOCAL"] = "true"
 
-def add_common_flags(parser: argparse.ArgumentParser) -> None:
-    """Attach shared arguments (wallet, domain, api-base) to a command parser."""
-    parser.add_argument("--wallet", required=True, help="Bittensor wallet name")
+    cmd = ["docker", "compose", "up", "--build"]
+    subprocess.run(cmd, env=env)
 
+# -------------------------------------------------------
+# Validator commands
+# -------------------------------------------------------
+@validator_app.command("create")
+def validator_create(
+    email: str = Argument(..., help="Email of the validator"),
+    name: str | None = Argument(None, help="Optional name"),
+):
+    """Create a validator account."""
+    create_user(email=email, name=name, is_miner=False)
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="bitsec.py",
-        description="Bitsec CLI for miners and validators (signed with hotkey)",
-    )
-
-    root = parser.add_subparsers(dest="group", required=True)
-
-    # Miner commands ---------------------------------------------------
-    miner = root.add_parser("miner", help="Miner operations")
-    miner_sub = miner.add_subparsers(dest="action", required=True)
-
-    # Create Miner account
-    mreg = miner_sub.add_parser("create", help="Create a miner account")
-    add_common_flags(mreg)
-    mreg.add_argument("--email", required=True)
-    mreg.add_argument("--name")
-
-    # Miner submit
-    msub = miner_sub.add_parser("submit", help="Submit a miner agent")
-    add_common_flags(msub)
-
-    # Validator commands -----------------------------------------------
-    validator = root.add_parser("validator", help="Validator operations")
-    validator_sub = validator.add_subparsers(dest="action", required=True)
-
-    # Create Validator account
-    vreg = validator_sub.add_parser("create", help="Create a validator account")
-    add_common_flags(vreg)
-    vreg.add_argument("--email", required=True)
-    vreg.add_argument("--name")
-
-    return parser
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-
-    if args.wallet:
-        PLATFORM_CLIENT.set_wallet(args.wallet)
-
-    if args.group == "miner":
-        if args.action == "create":
-            create_user(
-                email=args.email,
-                name=args.name,
-                is_miner=True,
-            )
-        elif args.action == "submit":
-            submit_agent()
-
-    elif args.group == "validator":
-        if args.action == "create":
-            create_user(
-                email=args.email,
-                name=args.name,
-                is_miner=False,
-            )
-
-
+# -------------------------------------------------------
+# Entry point
+# -------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    app()

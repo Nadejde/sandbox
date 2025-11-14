@@ -2,6 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_env: str | None = "development"
+    local: bool = False
     wallet_name: str | None = None
 
     chutes_api_key: str | None

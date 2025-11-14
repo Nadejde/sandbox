@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, Header, HTTPException
 import os
 import json
 import requests
+import time
 from loggers.logger import get_logger
 from models import InferenceRequest, InferenceResponse, Message
 
@@ -48,9 +49,10 @@ async def inference(
             # TODO: Add handling for errors, pass on some errors
 
         except requests.RequestException as e:
-            status = resp.status
+            status = resp.status_code
             if status not in (502, 429):
                 logger.error(f"Chutes API non-retryable error: {e} {resp.text}")
+                break
 
             if attempt == MAX_RETRIES:
                 logger.error(f"Chutes API error after {attempt} attempts: {e} {resp.text}")
