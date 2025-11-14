@@ -1,4 +1,5 @@
 from datetime import datetime
+from enum import StrEnum
 from pydantic import BaseModel
 
 
@@ -11,6 +12,10 @@ class JobRun(BaseModel):
     completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+class AgentCode(BaseModel):
+    code: str
 
 
 class AgentExecution(BaseModel):
@@ -48,3 +53,15 @@ class AgentEvaluation(BaseModel):
     missed_findings: list | None = None
     extra_findings: list | None = None
     undecided_findings: list | None = None
+
+
+class UserRole(StrEnum):
+    MINER = "MINER"
+    VALIDATOR = "VALIDATOR"
+
+
+class User(BaseModel):
+    email: str
+    name: str | None = None
+    role: UserRole = UserRole.MINER
+    hotkey: str | None = None

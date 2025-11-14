@@ -1,11 +1,15 @@
-from __future__ import annotations
-
+import base64
 import os
 import json
+import secrets
+from datetime import datetime, timedelta
 from typing import Any, Literal
-import requests
 
-from validator.models.platform import JobRun, AgentExecution, AgentEvaluation
+import requests
+from bittensor_wallet import Wallet
+
+from config import settings
+from validator.models.platform import JobRun, AgentExecution, AgentEvaluation, AgentCode, User
 
 
 class PlatformError(Exception):
@@ -16,22 +20,52 @@ class PlatformError(Exception):
 
 
 class PlatformClient:
-    def __init__(self, base_url: str, api_key: str, timeout: int = 10):
+    def __init__(self, base_url: str, timeout: int = 10, wallet_name: str | None = None):
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
         self.timeout = timeout
+        if wallet_name:
+            self.set_wallet(wallet_name)
 
-        self.headers = {"Authorization": f"Bearer {self.api_key}"}
+    def set_wallet(self, wallet_name: str | None = None):
+        wallet_name = wallet_name or settings.wallet_name
+        wallet = Wallet(wallet_name)
+        self.hotkey = wallet.hotkey
+
+    def _create_wallet_token(self, hotkey: str, expiry_minutes: int = 1) -> str:
+        iat = int(datetime.utcnow().timestamp())
+        exp = int((datetime.utcnow() + timedelta(minutes=expiry_minutes)).timestamp())
+        payload = {
+            "address": self.hotkey.ss58_address,
+            "nonce": secrets.token_hex(16),
+            "domain": settings.app_url,
+            "iat": iat,
+            "exp": exp
+        }
+
+        payload_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+        signature_bytes = hotkey.sign(payload_json.encode())
+        payload_b64 = base64.urlsafe_b64encode(payload_json.encode()).decode()
+        sig_b64 = base64.urlsafe_b64encode(signature_bytes).decode()
+        return f"{payload_b64}.{sig_b64}"
 
     def _call_api(
         self,
         method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"],
         endpoint: str,
         *,
+        authenticate: bool = False,
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list[Any] | None:
         url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
+
+        headers: dict[str, str] = {}
+        if authenticate:
+            if not self.hotkey:
+                raise ValueError("Wallet name must be provided via argument or WALLET_NAME environment variable.")
+
+            token = self._create_wallet_token(self.hotkey)
+            headers["Authorization"] = f"Bearer {token}"
 
         try:
             response = requests.request(
@@ -39,7 +73,7 @@ class PlatformClient:
                 url=url,
                 params=params,
                 json=json,
-                headers=self.headers,
+                headers=headers,
                 timeout=self.timeout,
             )
             response.raise_for_status()
@@ -85,13 +119,13 @@ class PlatformClient:
     def submit_agent_execution(self, agent_execution: AgentExecution) -> dict:
         endpoint = f"agents/execution/"
         payload = agent_execution.model_dump(mode="json")
-        resp = self._call_api("post", endpoint, json=payload)
+        resp = self._call_api("post", endpoint, json=payload, authenticate=True)
         return resp
 
     def submit_agent_evaluation(self, agent_evaluation: AgentEvaluation) -> dict:
         endpoint = f"agents/evaluation/"
         payload = agent_evaluation.model_dump(mode="json")
-        resp = self._call_api("post", endpoint, json=payload)
+        resp = self._call_api("post", endpoint, json=payload, authenticate=True)
         return resp
 
     def start_job_run(self, job_run_id: int) -> dict:
@@ -105,4 +139,16 @@ class PlatformClient:
             "status": status,
         }
         resp = self._call_api("post", endpoint, json=payload)
+        return resp
+
+    def submit_agent(self, agent_code: AgentCode) -> dict:
+        endpoint = f"agents/submit/"
+        payload = agent_code.model_dump(mode="json")
+        resp = self._call_api("post", endpoint, json=payload, authenticate=True)
+        return resp
+
+    def create_user(self, user: User) -> dict:
+        endpoint = f"users/"
+        payload = user.model_dump(mode="json")
+        resp = self._call_api("post", endpoint, json=payload, authenticate=True)
         return resp
