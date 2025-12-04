@@ -79,8 +79,8 @@ class BaselineRunner:
         }
 
         headers = {
-            "x_job_id": self.project_id or "local",
-            "x_project_id": self.job_id,
+            "x_project_id": self.project_id or "local",
+            "x_job_id": self.job_id,
         }
 
         resp = None
