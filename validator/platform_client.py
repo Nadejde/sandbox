@@ -50,7 +50,7 @@ class APIPlatformClient:
         payload = {
             "address": self.hotkey.ss58_address,
             "nonce": secrets.token_hex(16),
-            "domain": settings.app_url,
+            "domain": settings.platform_url,
             "iat": iat,
             "exp": exp,
         }
