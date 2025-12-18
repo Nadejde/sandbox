@@ -49,6 +49,7 @@ class APIPlatformClient:
             total=10,
             backoff_factor=0.5,
             status_forcelist=[500, 502, 503, 504],
+            allowed_methods=None,
         )
 
         session.mount("https://", HTTPAdapter(max_retries=retry))
