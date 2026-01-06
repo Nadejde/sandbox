@@ -24,7 +24,7 @@ jobs:
 
           echo "BUILD_NUM=${BUILD_NUM}" >> $GITHUB_ENV
 
-          cat > bitsec_platform/version.py <<EOF
+          cat > version.py <<EOF
           __build_number__ = ${BUILD_NUM}
           __git_sha__ = "${GIT_SHA}"
           __build_date__ = "${BUILD_DATE}"
@@ -36,6 +36,6 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git add bitsec_platform/version.py
+          git add version.py
           git commit -m "[skip ci] increment to build ${BUILD_NUM}"
           git push
