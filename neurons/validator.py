@@ -112,11 +112,10 @@ class Validator(BaseValidatorNeuron):
             bt.logging.critical("Validator background thread died with exception:")
             bt.logging.critical(self.thread_exception)
 
-            # Clean up resources before exiting
             try:
-                if hasattr(self, 'dendrite') and hasattr(self.dendrite, 'session'):
+                if hasattr(self, "dendrite"):
                     bt.logging.info("Closing dendrite session")
-                    self.dendrite.session.close()
+                    self.dendrite.close_session()
             except Exception as e:
                 bt.logging.error(f"Error closing dendrite session: {e}")
 
