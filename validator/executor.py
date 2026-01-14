@@ -122,9 +122,18 @@ class AgentExecutor:
         report_dict['validator_id'] = self.job_run.validator_id
         report_dict['job_run_id'] = self.job_run.id
         report_dict['project'] = self.project_key
-        report_dict['status'] = 'success'
         report_dict['started_at'] = self.started_at
         report_dict['completed_at'] = datetime.utcnow()
+
+        if isinstance(report_dict['report'], dict) and report_dict['report'].get("vulnerabilities") is not None:
+            report_dict['status'] = 'success'
+
+        else:
+            report_dict['status'] = 'error'
+            report_dict['report'] = {
+                "report_parsing_error": str(report_dict['report']),
+                "vulnerabilities": [],
+            }
 
         agent_execution = AgentExecution.model_validate(report_dict)
 
@@ -239,7 +248,11 @@ class AgentExecutor:
                 }
 
             # Extract agent findings
-            agent_findings = report_data.get("report", {}).get("vulnerabilities", [])
+            try:
+                agent_findings = report_data.get("report", {}).get("vulnerabilities", [])
+            except AttributeError as e:
+                logger.error(f"Invalid report vulnerabilities: {report_data['report']}")
+                agent_findings = []
 
             self.logger.info(
                 f"Scoring {self.project_key}: "
