@@ -13,12 +13,14 @@ from validator.models.platform import AgentExecution, AgentEvaluation, Status
 from validator.platform_client import PlatformError
 from validator.scorer import ScaBenchScorerV2
 
+import asyncio
 
 logger = get_logger()
 
 SANDBOX_CONTAINER_TMPL = 'bitsec_sandbox_{job_run_id}_{project_key}'
 PROJECT_IMAGE_TAG_TMPL = 'ghcr.io/bitsec-ai/{project_key}:latest'
 
+from scripts.projects import fetch_projects
 
 class AgentExecutor:
     def __init__(
@@ -43,6 +45,9 @@ class AgentExecutor:
         self.started_at = None
 
         self.init_logger()
+        
+        fetch_projects() # this is required to build the agent sandbox images. Only does work once.
+        
 
     def init_logger(self):
         prefix = f"[J:{self.job_run.job_id}|JR:{self.job_run.id}|P:{self.project_key}] "
@@ -57,17 +62,25 @@ class AgentExecutor:
             self.logger.error(f"Exit code {e.return_code} while running {e.docker_command}")
             raise
 
-    def run(self):
+    async def run(self):
         self.started_at = datetime.utcnow()
 
         if not settings.skip_execution:
-            self.run_project()
+            await self.run_project()
             self.agent_execution_id = self.submit_agent_execution()
 
         if not settings.skip_evaluation:
             self.eval_job_run()
 
-    def run_project(self):
+    async def run_project(self):
+        # build the docker image for the agent sandbox here
+        # this only takes time the first time it gets run because docker will cache the image
+        agent_sandbox_docker_dir = os.path.join(settings.validator_dir, 'agent_sandbox')
+        project_dir = os.path.abspath(os.path.join('projects', self.project_key))
+        
+        IMAGE = f"ghcr.io/bitsec-ai/agent-sandbox:latest"
+        docker.build(agent_sandbox_docker_dir, tags=[IMAGE])
+        
         sandbox_container = SANDBOX_CONTAINER_TMPL.format(
             job_run_id=self.job_run.id,
             project_key=self.project_key,
@@ -79,12 +92,14 @@ class AgentExecutor:
         project_image_tag = PROJECT_IMAGE_TAG_TMPL.format(project_key=self.project_key)
 
         self.logger.info("Starting container")
-        container = docker.run(
-            project_image_tag,
+        container = await asyncio.to_thread(
+            docker.run,
+            IMAGE, #project_image_tag, #"docker.io/library/agent-sandbox:latest", #
             name=sandbox_container,
             networks=[settings.proxy_network],
             volumes=[
                 (self.agent_filepath, '/app/agent.py'),
+                (project_dir, '/app/project_code'),
             ],
             envs={
                 "JOB_RUN_ID": self.job_run.id,
@@ -96,19 +111,36 @@ class AgentExecutor:
             pids_limit=64,
             detach=True,
         )
-        docker.wait(container)
+        # Print docker logs from the above container
+        await asyncio.to_thread(docker.wait, container)
 
         try:
-            docker.copy((container, "/app/report.json"), self.project_report_dir)
+            await asyncio.to_thread(docker.copy, (container, "/app/report.json"), self.project_report_dir)
             self.logger.info(f"Finished processing. Report copied: {self.project_key} {self.project_report_dir}")
-
+            
+            """ optional debug logging of agent stdout/stderr
+            # Read and log agent stdout/stderr for debugging
+            report_filepath = os.path.join(self.project_report_dir, 'report.json')
+            
+            if Path(report_filepath).is_file():
+                with open(report_filepath, "r", encoding="utf-8") as f:
+                    report_data = json.load(f)
+                
+                stdout_content = report_data.get("stdout", "")
+                stderr_content = report_data.get("stderr", "")
+                
+                if stdout_content:
+                    self.logger.info(f"Agent stdout:\n{stdout_content}")
+                if stderr_content:
+                    self.logger.error(f"Agent stderr:\n{stderr_content}")
+            """
         except DockerException as e:
             if e.return_code == 1 and "does not exist" in str(e):
                 self.logger.error("Report not found in container")
             else:
                 raise
 
-        container.remove()
+        await asyncio.to_thread(container.remove)
 
     def submit_agent_execution(self):
         report_filepath = os.path.join(self.project_report_dir, 'report.json')
