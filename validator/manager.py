@@ -123,7 +123,7 @@ class SandboxManager:
                 'agent.py',
             )
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         tasks = []
 
         for project_key in agent['project_keys']:
